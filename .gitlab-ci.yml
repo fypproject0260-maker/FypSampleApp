@@ -1,0 +1,35 @@
+stages:
+  - build
+  - test
+  - deploy
+
+default:
+  tags:
+    - ubuntu-local
+
+# 1. BUILD: build the Docker image from your Dockerfile
+build:
+  stage: build
+  script:
+    - docker build -t fypsampleapp:$CI_COMMIT_SHORT_SHA -t fypsampleapp:latest .
+
+# 2. TEST: run unit tests, then smoke-test the built container
+test:
+  stage: test
+  script:
+    - docker run --rm -v "$PWD":/app -w /app node:20-alpine sh -c "npm ci && npm test --if-present"
+    - docker rm -f fypsampleapp-test || true
+    - docker run -d --name fypsampleapp-test fypsampleapp:latest
+    - sleep 5
+    - docker exec fypsampleapp-test wget -qO- http://localhost:6767/
+  after_script:
+    - docker rm -f fypsampleapp-test || true
+
+# 3. DEPLOY: run the app with docker compose
+deploy:
+  stage: deploy
+  script:
+    - docker compose up -d --build --force-recreate
+    - docker compose ps
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
