@@ -1,19 +1,21 @@
+
 stages:
   - build
   - test
+  - build-sonar
   - deploy
 
 default:
   tags:
     - ubuntu-local
 
-# 1. BUILD: build the Docker image from your Dockerfile
+# 1. BUILD: Build Docker image
 build:
   stage: build
   script:
     - docker build -t fypsampleapp:$CI_COMMIT_SHORT_SHA -t fypsampleapp:latest .
 
-# 2. TEST: run unit tests, then smoke-test the built container
+# 2. TEST: Run unit tests and smoke test
 test:
   stage: test
   script:
@@ -25,11 +27,35 @@ test:
   after_script:
     - docker rm -f fypsampleapp-test || true
 
-# 3. DEPLOY: run the app with docker compose
+# 3. SONARQUBE: Analyze code quality
+build-sonar:
+  image:
+    name: sonarsource/sonar-scanner-cli:11
+    entrypoint: [""]
+  stage: build-sonar
+  variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
+    GIT_DEPTH: "0"
+  cache:
+    policy: pull-push
+    key: "sonar-cache-$CI_COMMIT_REF_SLUG"
+    paths:
+      - "${SONAR_USER_HOME}/cache"
+      - sonar-scanner/
+  script:
+    - sonar-scanner -Dsonar.host.url="${SONAR_HOST_URL}"
+  allow_failure: true
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "master"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+
+# 4. DEPLOY: Deploy using Docker Compose
 deploy:
   stage: deploy
   script:
     - docker compose up -d --build --force-recreate
     - docker compose ps
   rules:
-    - if: $CI_COMMIT_BRANCH == "main"
+    - if: '$CI_COMMIT_BRANCH == "main"'
