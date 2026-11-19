@@ -1,0 +1,71 @@
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fyp-sample-app
+  labels:
+    app: fyp-sample-app
+
+spec:
+  replicas: 3
+
+  revisionHistoryLimit: 3
+  minReadySeconds: 5
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+
+  selector:
+    matchLabels:
+      app: fyp-sample-app
+
+  template:
+    metadata:
+      labels:
+        app: fyp-sample-app
+
+    spec:
+      containers:
+        - name: fyp-sample-app
+
+          image: 279264839125.dkr.ecr.ap-southeast-2.amazonaws.com/fyp-sample-app:latest
+          imagePullPolicy: Always
+
+          ports:
+            - containerPort: 6767
+              name: http
+
+          # Startup health check
+          startupProbe:
+            tcpSocket:
+              port: 6767
+            periodSeconds: 5
+            failureThreshold: 12
+
+          # Ready for Traffic handling
+          readinessProbe:
+            tcpSocket:
+              port: 6767
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+
+          # Self healing
+          livenessProbe:
+            tcpSocket:
+              port: 6767
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 3
+
+          # Resource management
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
