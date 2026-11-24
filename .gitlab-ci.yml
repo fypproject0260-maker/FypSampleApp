@@ -1,13 +1,19 @@
-
 stages:
   - build
   - test
   - build-sonar
+  - push
   - deploy
 
 default:
   tags:
     - ubuntu-local
+
+variables:
+  ECR_REGISTRY: "279264839125.dkr.ecr.ap-southeast-2.amazonaws.com"
+  ECR_REPO: "fyp-sample-app"
+  K8S_DEPLOYMENT: "fyp-sample-app"
+  K8S_CONTAINER: "fyp-sample-app"
 
 # 1. BUILD: Build Docker image
 build:
@@ -27,13 +33,23 @@ test:
   after_script:
     - docker rm -f fypsampleapp-test || true
 
-# 3. SONARQUBE: Analyze code quality
+# 3. SONARQUBE: Analyze code quality (parked, unchanged)
 build-sonar:
+  image:
+    name: sonarsource/sonar-scanner-cli:11
+    entrypoint: [""]
   stage: build-sonar
   variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
     GIT_DEPTH: "0"
+  cache:
+    policy: pull-push
+    key: "sonar-cache-$CI_COMMIT_REF_SLUG"
+    paths:
+      - "${SONAR_USER_HOME}/cache"
+      - sonar-scanner/
   script:
-    - docker run --rm --network host --user "$(id -u):$(id -g)" -e SONAR_USER_HOME=/tmp/.sonar -e SONAR_HOST_URL -e SONAR_TOKEN -v "$PWD":/usr/src sonarsource/sonar-scanner-cli:11
+    - sonar-scanner -Dsonar.host.url="${SONAR_HOST_URL}"
   allow_failure: true
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
@@ -41,11 +57,34 @@ build-sonar:
     - if: '$CI_COMMIT_BRANCH == "main"'
     - if: '$CI_COMMIT_BRANCH == "develop"'
 
-# 4. DEPLOY: Deploy using Docker Compose
+# 4. PUSH: Publish the image to Amazon ECR
+push:
+  stage: push
+  script:
+    - aws --version
+    - aws sts get-caller-identity --query Arn --output text
+    - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+    - docker tag fypsampleapp:$CI_COMMIT_SHORT_SHA $ECR_REGISTRY/$ECR_REPO:$CI_COMMIT_SHORT_SHA
+    - docker push $ECR_REGISTRY/$ECR_REPO:$CI_COMMIT_SHORT_SHA
+    - docker tag fypsampleapp:$CI_COMMIT_SHORT_SHA $ECR_REGISTRY/$ECR_REPO:latest
+    - docker push $ECR_REGISTRY/$ECR_REPO:latest
+  after_script:
+    - docker logout "$ECR_REGISTRY" || true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+# 5. DEPLOY: Roll out the new image to Amazon EKS
 deploy:
   stage: deploy
+  variables:
+    KUBECONFIG: "/tmp/kubeconfig-$CI_PIPELINE_ID"
   script:
-    - docker compose up -d --build --force-recreate
-    - docker compose ps
+    - kubectl version --client
+    - aws eks update-kubeconfig --name fyp-eks-cluster --region "$AWS_DEFAULT_REGION"
+    - kubectl set image deployment/$K8S_DEPLOYMENT $K8S_CONTAINER=$ECR_REGISTRY/$ECR_REPO:$CI_COMMIT_SHORT_SHA
+    - kubectl rollout status deployment/$K8S_DEPLOYMENT --timeout=180s || (kubectl rollout undo deployment/$K8S_DEPLOYMENT && exit 1)
+    - kubectl get pods -l app=fyp-sample-app -o wide
+  after_script:
+    - rm -f "/tmp/kubeconfig-$CI_PIPELINE_ID"
   rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
