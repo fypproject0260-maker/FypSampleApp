@@ -22,17 +22,62 @@ build:
     - docker build -t fypsampleapp:$CI_COMMIT_SHORT_SHA -t fypsampleapp:latest .
 
 # 2. TEST: Run unit tests and smoke test
+# 2. TEST: syntax check, dependency audit, smoke + functional tests
 test:
   stage: test
+  variables:
+    TEST_NET: "fyp-test-net-$CI_PIPELINE_ID"
+    TEST_APP: "fyp-test-app-$CI_PIPELINE_ID"
   script:
-    - docker run --rm --user "$(id -u):$(id -g)" -e npm_config_cache=/tmp/.npm -v "$PWD":/app -w /app node:20-alpine sh -c "npm ci && node --check server.js"
-    - docker rm -f fypsampleapp-test || true
-    - docker run -d --name fypsampleapp-test fypsampleapp:latest
-    - sleep 5
-    - docker exec fypsampleapp-test wget -qO- http://localhost:6767/
-  after_script:
-    - docker rm -f fypsampleapp-test || true
+    # Level 1a: syntax check
+    - docker run --rm -v "$PWD":/app:ro -w /app node:20-alpine node --check server.js
 
+    # Dependency audit: fail on high/critical vulnerabilities in production packages
+    - docker run --rm -v "$PWD":/app:ro -w /app node:20-alpine npm audit --omit=dev --audit-level=high
+
+    # Level 1b: start THIS commit's image on a private network (no host port, so no clash with 6767)
+    - docker network create "$TEST_NET"
+    - docker run -d --name "$TEST_APP" --network "$TEST_NET" fypsampleapp:$CI_COMMIT_SHORT_SHA
+    - |
+      for i in $(seq 1 30); do
+        if docker exec "$TEST_APP" wget -qO- http://localhost:6767/ >/dev/null 2>&1; then
+          echo "App is up after ${i}s"; break
+        fi
+        if [ "$i" -eq 30 ]; then
+          echo "App did not start within 30s"; docker logs "$TEST_APP"; exit 1
+        fi
+        sleep 1
+      done
+
+    # Levels 2 + 3: smoke and functional tests with curl, from a separate container
+    - docker pull -q curlimages/curl:8.10.1
+    - |
+      CURL="docker run --rm --network $TEST_NET curlimages/curl:8.10.1 -s"
+      APP="http://$TEST_APP:6767"
+      USER_NAME="ciuser"
+      FAILED=0
+      check() { if echo "$3" | grep -q "$2"; then echo "PASS: $1"; else echo "FAIL: $1 (expected '$2', got '$3')"; FAILED=1; fi; }
+
+      # Level 2: pages load
+      check "Login page loads (200)"               "^200"          "$($CURL -o /dev/null -w '%{http_code}' $APP/)"
+      check "Login page has a form"                "<form"         "$($CURL $APP/)"
+      check "Signup page loads (200)"              "^200"          "$($CURL -o /dev/null -w '%{http_code}' $APP/signup)"
+
+      # Level 3: app logic
+      check "/home redirects to / when logged out" "^302 /$"       "$($CURL -o /dev/null -w '%{http_code} %header{location}' $APP/home)"
+      check "Signup redirects to /home"            "^302 /home$"   "$($CURL -o /dev/null -w '%{http_code} %header{location}' -d "username=$USER_NAME&password=secret123" $APP/signup)"
+      check "Welcome page shows the username"      "Welcome, $USER_NAME" "$($CURL $APP/home)"
+      check "Duplicate username is rejected"       "already taken" "$($CURL -d "username=$USER_NAME&password=other" $APP/signup)"
+      check "Logout redirects to /"                "^302 /$"       "$($CURL -o /dev/null -w '%{http_code} %header{location}' -X POST $APP/logout)"
+      check "Wrong password is rejected"           "Wrong username or password" "$($CURL -d "username=$USER_NAME&password=wrong" $APP/login)"
+      check "Correct login redirects to /home"     "^302 /home$"   "$($CURL -o /dev/null -w '%{http_code} %header{location}' -d "username=$USER_NAME&password=secret123" $APP/login)"
+
+      if [ "$FAILED" -ne 0 ]; then echo "Some tests failed"; exit 1; fi
+      echo "All tests passed"
+  after_script:
+    - docker logs "$TEST_APP" || true
+    - docker rm -f "$TEST_APP" || true
+    - docker network rm "$TEST_NET" || true
 # 3. SONARQUBE: Analyze code quality (parked, unchanged)
 build-sonar:
   image:
