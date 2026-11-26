@@ -1,0 +1,186 @@
+# Lean Prometheus for a single t3.small node (prometheus-community/prometheus chart)
+# Install:  helm upgrade --install prometheus prometheus-community/prometheus \
+#             -n monitoring --create-namespace -f prometheus-values.yaml
+# Pods added: prometheus-server, kube-state-metrics, node-exporter (3 total)
+
+# ---------- Components we do NOT run ----------
+alertmanager:
+  enabled: false
+prometheus-pushgateway:
+  enabled: false
+
+# ---------- kube-state-metrics (replicas, restarts, pod status) ----------
+kube-state-metrics:
+  enabled: true
+  prometheusScrape: true            # adds prometheus.io/scrape annotation to its Service
+  collectors:                       # only what the dashboard needs -> less memory
+    - pods
+    - deployments
+    - statefulsets
+    - nodes
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 96Mi
+
+# ---------- node-exporter (node CPU / memory / disk) ----------
+prometheus-node-exporter:
+  enabled: true
+  service:
+    annotations:
+      prometheus.io/scrape: "true"
+  resources:
+    requests:
+      cpu: 10m
+      memory: 16Mi
+    limits:
+      cpu: 100m
+      memory: 48Mi
+
+# ---------- config-reload sidecar inside the prometheus-server pod ----------
+configmapReload:
+  prometheus:
+    resources:
+      requests:
+        cpu: 5m
+        memory: 16Mi
+      limits:
+        cpu: 50m
+        memory: 32Mi
+
+# ---------- Prometheus server ----------
+server:
+  global:
+    scrape_interval: 60s            # default 15s; 60s = less CPU (T3 credits) and memory
+    evaluation_interval: 60s
+    scrape_timeout: 10s
+  retention: "1d"
+  retentionSize: "500MB"
+  persistentVolume:
+    enabled: false                  # emptyDir: no EBS volume; history resets if the pod restarts
+  resources:
+    requests:
+      cpu: 50m
+      memory: 150Mi
+    limits:
+      cpu: 300m
+      memory: 400Mi
+
+# ---------- Chart's built-in default jobs (chart 29.x/30.x) ----------
+# The chart renders these IN ADDITION to serverFiles below, so any job we define
+# ourselves must be switched off here, or Prometheus fails with "multiple scrape
+# configs with job name ...". We keep only the chart's own "prometheus" self-scrape.
+# (A key that doesn't exist in this chart version is harmless: enabled=false skips it.)
+scrapeConfigs:
+  prometheus:
+    enabled: true
+  kubernetes-api-servers:
+    enabled: false
+  kubernetes-apiservers:
+    enabled: false
+  kubernetes-nodes:
+    enabled: false
+  kubernetes-nodes-cadvisor:
+    enabled: false
+  kubernetes-service-endpoints:
+    enabled: false
+  kubernetes-service-endpoints-slow:
+    enabled: false
+  prometheus-pushgateway:
+    enabled: false
+  kubernetes-services:
+    enabled: false
+  kubernetes-pods:
+    enabled: false
+  kubernetes-pods-slow:
+    enabled: false
+
+# ---------- Our own scrape jobs ----------
+# Dropped on purpose: kubernetes-apiservers (very high memory use), kubelet,
+# *-slow jobs, pushgateway, blackbox probes.
+serverFiles:
+  prometheus.yml:
+    scrape_configs:
+
+      # NOTE: no "prometheus" self-scrape job here: chart 30.x already adds one,
+      # and a duplicate job name makes Prometheus refuse to start.
+
+      # Container CPU / memory per pod (cAdvisor, scraped directly from the kubelet
+      # on each node at <node-ip>:10250/metrics/cadvisor, same route as the chart default;
+      # the API-server proxy route returned 403 because the chart's RBAC has no nodes/proxy)
+      - job_name: kubernetes-nodes-cadvisor
+        scheme: https
+        metrics_path: /metrics/cadvisor
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          insecure_skip_verify: true
+        authorization:
+          credentials_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_node_name]
+            target_label: node
+        metric_relabel_configs:
+          # keep only the container metrics we chart -> far fewer series
+          - source_labels: [__name__]
+            regex: container_cpu_usage_seconds_total|container_memory_working_set_bytes|container_cpu_cfs_throttled_periods_total|container_cpu_cfs_periods_total|container_network_receive_bytes_total|container_network_transmit_bytes_total|container_fs_usage_bytes
+            action: keep
+
+      # Services annotated prometheus.io/scrape=true (kube-state-metrics, node-exporter)
+      - job_name: kubernetes-service-endpoints
+        honor_labels: true
+        kubernetes_sd_configs:
+          - role: endpoints
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scheme]
+            action: replace
+            target_label: __scheme__
+            regex: (https?)
+          - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels: [__address__, __meta_kubernetes_service_annotation_prometheus_io_port]
+            action: replace
+            target_label: __address__
+            regex: (.+?)(?::\d+)?;(\d+)
+            replacement: $1:$2
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_service_name]
+            target_label: service
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            target_label: node
+
+      # Pods annotated prometheus.io/scrape=true (postgres-exporter sidecar on :9187)
+      - job_name: kubernetes-pods
+        honor_labels: true
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels: [__meta_kubernetes_pod_phase]
+            action: drop
+            regex: Pending|Succeeded|Failed|Completed
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            target_label: __address__
+            regex: (.+?)(?::\d+)?;(\d+)
+            replacement: $1:$2
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod

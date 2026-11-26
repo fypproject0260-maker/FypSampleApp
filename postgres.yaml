@@ -1,0 +1,140 @@
+# PostgreSQL for FypSampleApp (single pod, hostPath storage, postgres-exporter sidecar)
+# Apply with:  kubectl apply -f postgres.yaml
+# Requires the Secret "postgres-secret" (created separately, NOT stored in git).
+# Storage note: data lives on the worker node's disk (/var/lib/fyp-postgres).
+# It survives pod restarts, but is lost if the node is replaced -> back up with pg_dump.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init
+  labels:
+    app: postgres
+data:
+  # Runs automatically ONLY when the data directory is empty (first start on a fresh node).
+  01-schema.sql: |
+    CREATE TABLE IF NOT EXISTS users (
+      id            SERIAL PRIMARY KEY,
+      username      VARCHAR(50)  UNIQUE NOT NULL,
+      email         VARCHAR(255) UNIQUE NOT NULL,
+      password_hash VARCHAR(255) NOT NULL,
+      created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+    );
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  labels:
+    app: postgres
+spec:
+  clusterIP: None            # headless: internal only, never exposed outside the cluster
+  selector:
+    app: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  labels:
+    app: postgres
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+      annotations:
+        # Picked up by the Prometheus "kubernetes-pods" scrape job
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9187"
+        prometheus.io/path: "/metrics"
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        # ---------- PostgreSQL ----------
+        - name: postgres
+          image: postgres:16-alpine
+          args: ["-c", "shared_buffers=32MB", "-c", "max_connections=30"]
+          ports:
+            - name: postgres
+              containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: postgres-secret     # POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          resources:
+            requests:
+              cpu: 50m
+              memory: 96Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -h 127.0.0.1 -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -h 127.0.0.1 -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 3
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: init
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+
+        # ---------- postgres-exporter (sidecar, exposes metrics on :9187) ----------
+        - name: postgres-exporter
+          image: quay.io/prometheuscommunity/postgres-exporter:v0.17.1
+          ports:
+            - name: metrics
+              containerPort: 9187
+          env:
+            - name: DB_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: POSTGRES_DB
+            - name: DATA_SOURCE_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: POSTGRES_USER
+            - name: DATA_SOURCE_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: POSTGRES_PASSWORD
+            - name: DATA_SOURCE_URI
+              value: "127.0.0.1:5432/$(DB_NAME)?sslmode=disable"
+          resources:
+            requests:
+              cpu: 10m
+              memory: 24Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+
+      volumes:
+        - name: data
+          hostPath:
+            path: /var/lib/fyp-postgres
+            type: DirectoryOrCreate
+        - name: init
+          configMap:
+            name: postgres-init
