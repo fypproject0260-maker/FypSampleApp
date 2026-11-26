@@ -13,3 +13,6 @@ script.deb.sh
 npm-debug.log*
 .DS_Store
 .vscode/
+
+kubectl
+cmds.txt

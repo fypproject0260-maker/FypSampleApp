@@ -1,0 +1,34 @@
+# Adds database + session settings to the fyp-sample-app container.
+# Apply with:  kubectl patch deployment fyp-sample-app --patch-file app-env-patch.yaml
+# (patch, not apply: it only adds these env vars and does NOT touch the image tag the pipeline set)
+# Copy the same "env:" block into deployment.yaml under the fyp-sample-app container so git matches.
+spec:
+  template:
+    spec:
+      containers:
+        - name: fyp-sample-app
+          env:
+            - name: DB_HOST
+              value: postgres              # the headless Service from postgres.yaml
+            - name: DB_PORT
+              value: "5432"
+            - name: DB_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: POSTGRES_DB
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: POSTGRES_USER
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: POSTGRES_PASSWORD
+            - name: SESSION_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: app-session-secret
+                  key: SESSION_SECRET

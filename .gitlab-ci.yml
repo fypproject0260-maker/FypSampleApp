@@ -28,6 +28,8 @@ test:
   variables:
     TEST_NET: "fyp-test-net-$CI_PIPELINE_ID"
     TEST_APP: "fyp-test-app-$CI_PIPELINE_ID"
+    TEST_DB: "fyp-test-db-$CI_PIPELINE_ID"
+    JAR_DIR: "/tmp/fyp-test-jar-$CI_PIPELINE_ID"
   script:
     # Level 1a: syntax check
     - docker run --rm -v "$PWD":/app:ro -w /app node:20-alpine node --check server.js
@@ -35,24 +37,43 @@ test:
     # Dependency audit: fail on high/critical vulnerabilities in production packages
     - docker run --rm -v "$PWD":/app:ro -w /app node:20-alpine npm audit --omit=dev --audit-level=high
 
-    # Level 1b: start THIS commit's image on a private network (no host port, so no clash with 6767)
+    # Private test network + throwaway Postgres (test-only credentials, not real secrets)
     - docker network create "$TEST_NET"
-    - docker run -d --name "$TEST_APP" --network "$TEST_NET" fypsampleapp:$CI_COMMIT_SHORT_SHA
+    - docker run -d --name "$TEST_DB" --network "$TEST_NET" -e POSTGRES_USER=ci -e POSTGRES_PASSWORD=ci -e POSTGRES_DB=ci postgres:16-alpine
     - |
       for i in $(seq 1 30); do
-        if docker exec "$TEST_APP" wget -qO- http://localhost:6767/ >/dev/null 2>&1; then
-          echo "App is up after ${i}s"; break
+        # -h 127.0.0.1 = TCP check, only succeeds once Postgres has fully finished initialising
+        if docker exec "$TEST_DB" pg_isready -h 127.0.0.1 -U ci -d ci >/dev/null 2>&1; then
+          echo "Postgres is up after ${i}s"; break
         fi
-        if [ "$i" -eq 30 ]; then
-          echo "App did not start within 30s"; docker logs "$TEST_APP"; exit 1
+        if [ "$i" -eq 30 ]; then echo "Postgres did not start within 30s"; docker logs "$TEST_DB"; exit 1; fi
+        sleep 1
+      done
+
+    # Level 1b: start THIS commit's image, pointed at the test database (no host port, so no clash with 6767)
+    - >
+      docker run -d --name "$TEST_APP" --network "$TEST_NET"
+      -e DB_HOST="$TEST_DB" -e DB_USER=ci -e DB_PASSWORD=ci -e DB_NAME=ci
+      -e SESSION_SECRET=ci-test-only-secret
+      fypsampleapp:$CI_COMMIT_SHORT_SHA
+    - |
+      for i in $(seq 1 60); do
+        if docker exec "$TEST_APP" wget -qO- http://localhost:6767/healthz >/dev/null 2>&1; then
+          echo "App is up and connected to Postgres after ${i}s"; break
+        fi
+        if [ "$i" -eq 60 ]; then
+          echo "App did not become healthy within 60s"; docker logs "$TEST_APP"; exit 1
         fi
         sleep 1
       done
 
-    # Levels 2 + 3: smoke and functional tests with curl, from a separate container
+    # Levels 2 + 3: smoke and functional tests with curl, from a separate container.
+    # The cookie jar (shared folder) lets consecutive curl calls act like ONE browser session.
     - docker pull -q curlimages/curl:8.10.1
+    - mkdir -p "$JAR_DIR" && chmod 777 "$JAR_DIR"
     - |
       CURL="docker run --rm --network $TEST_NET curlimages/curl:8.10.1 -s"
+      CURLJ="docker run --rm --network $TEST_NET -v $JAR_DIR:/jar curlimages/curl:8.10.1 -s -b /jar/cookies.txt -c /jar/cookies.txt"
       APP="http://$TEST_APP:6767"
       USER_NAME="ciuser"
       FAILED=0
@@ -62,22 +83,30 @@ test:
       check "Login page loads (200)"               "^200"          "$($CURL -o /dev/null -w '%{http_code}' $APP/)"
       check "Login page has a form"                "<form"         "$($CURL $APP/)"
       check "Signup page loads (200)"              "^200"          "$($CURL -o /dev/null -w '%{http_code}' $APP/signup)"
+      check "Health check reports database ok"     "^ok$"          "$($CURL $APP/healthz)"
 
       # Level 3: app logic
       check "/home redirects to / when logged out" "^302 /$"       "$($CURL -o /dev/null -w '%{http_code} %header{location}' $APP/home)"
-      check "Signup redirects to /home"            "^302 /home$"   "$($CURL -o /dev/null -w '%{http_code} %header{location}' -d "username=$USER_NAME&password=secret123" $APP/signup)"
-      check "Welcome page shows the username"      "Welcome, $USER_NAME" "$($CURL $APP/home)"
+      check "Signup redirects to /home"            "^302 /home$"   "$($CURLJ -o /dev/null -w '%{http_code} %header{location}' -d "username=$USER_NAME&password=secret123" $APP/signup)"
+      check "Welcome page shows the username"      "Welcome, $USER_NAME" "$($CURLJ $APP/home)"
+      check "Other visitors are NOT logged in"     "^302 /$"       "$($CURL -o /dev/null -w '%{http_code} %header{location}' $APP/home)"
       check "Duplicate username is rejected"       "already taken" "$($CURL -d "username=$USER_NAME&password=other" $APP/signup)"
-      check "Logout redirects to /"                "^302 /$"       "$($CURL -o /dev/null -w '%{http_code} %header{location}' -X POST $APP/logout)"
+      check "Logout redirects to /"                "^302 /$"       "$($CURLJ -o /dev/null -w '%{http_code} %header{location}' -X POST $APP/logout)"
+      check "Logged out session can't see /home"   "^302 /$"       "$($CURLJ -o /dev/null -w '%{http_code} %header{location}' $APP/home)"
       check "Wrong password is rejected"           "Wrong username or password" "$($CURL -d "username=$USER_NAME&password=wrong" $APP/login)"
-      check "Correct login redirects to /home"     "^302 /home$"   "$($CURL -o /dev/null -w '%{http_code} %header{location}' -d "username=$USER_NAME&password=secret123" $APP/login)"
+      check "Correct login redirects to /home"     "^302 /home$"   "$($CURLJ -o /dev/null -w '%{http_code} %header{location}' -d "username=$USER_NAME&password=secret123" $APP/login)"
+
+      # Level 3b: the account really is in Postgres, and the password is not stored as plain text
+      check "User row saved in Postgres"           "^1$"           "$(docker exec $TEST_DB psql -U ci -d ci -tAc "SELECT count(*) FROM users WHERE username='$USER_NAME'")"
+      check "Password not stored as plain text"    "^0$"           "$(docker exec $TEST_DB psql -U ci -d ci -tAc "SELECT count(*) FROM users WHERE username='$USER_NAME' AND password_hash='secret123'")"
 
       if [ "$FAILED" -ne 0 ]; then echo "Some tests failed"; exit 1; fi
       echo "All tests passed"
   after_script:
     - docker logs "$TEST_APP" || true
-    - docker rm -f "$TEST_APP" || true
+    - docker rm -f "$TEST_APP" "$TEST_DB" || true
     - docker network rm "$TEST_NET" || true
+    - rm -rf "$JAR_DIR" || true
 # 3. SONARQUBE: Analyze code quality (parked, unchanged)
 build-sonar:
   image:
