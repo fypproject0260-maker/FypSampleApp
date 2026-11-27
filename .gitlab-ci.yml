@@ -107,29 +107,25 @@ test:
     - docker rm -f "$TEST_APP" "$TEST_DB" || true
     - docker network rm "$TEST_NET" || true
     - rm -rf "$JAR_DIR" || true
-# 3. SONARQUBE: Analyze code quality (parked, unchanged)
+
+# 3. SONARQUBE: Scan the code for bugs and security problems
 build-sonar:
-  image:
-    name: sonarsource/sonar-scanner-cli:11
-    entrypoint: [""]
   stage: build-sonar
   variables:
-    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
     GIT_DEPTH: "0"
-  cache:
-    policy: pull-push
-    key: "sonar-cache-$CI_COMMIT_REF_SLUG"
-    paths:
-      - "${SONAR_USER_HOME}/cache"
-      - sonar-scanner/
   script:
-    - sonar-scanner -Dsonar.host.url="${SONAR_HOST_URL}"
+    - >
+      docker run --rm
+      --network host
+      --user "$(id -u):$(id -g)"
+      -v "$CI_PROJECT_DIR":/usr/src
+      -e SONAR_HOST_URL="$SONAR_HOST_URL"
+      -e SONAR_TOKEN="$SONAR_TOKEN"
+      -e SONAR_USER_HOME=/usr/src/.sonar
+      sonarsource/sonar-scanner-cli:11
   allow_failure: true
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-    - if: '$CI_COMMIT_BRANCH == "master"'
     - if: '$CI_COMMIT_BRANCH == "main"'
-    - if: '$CI_COMMIT_BRANCH == "develop"'
 
 # 4. PUSH: Publish the image to Amazon ECR
 push:
