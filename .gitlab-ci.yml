@@ -123,6 +123,7 @@ build-sonar:
       -e SONAR_TOKEN="$SONAR_TOKEN"
       -e SONAR_USER_HOME=/usr/src/.sonar
       sonarsource/sonar-scanner-cli:11
+      -Dsonar.working.directory=/usr/src/.scannerwork
   allow_failure: true
   rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
